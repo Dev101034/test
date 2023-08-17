@@ -1,122 +1,56 @@
 import boto3
-
-def get_rds_events():
-    rds_client = boto3.client('rds', region_name='us-east-1')
-    
-    # Describe RDS events
-    response = rds_client.describe_events(SourceType='db-instance')
-    events = response.get('Events', [])
-    open_upcoming_events = []
-    
-    # Filter events with status codes "open" and "upcoming"
-    for event in events:
-        if event['EventStatus'] in ('open', 'upcoming'):
-            open_upcoming_events.append(event)
-    
-    return open_upcoming_events
-
-def get_ec2_events():
-    ec2_client = boto3.client('ec2', region_name='us-east-1')
-    
-    # Describe EC2 events
-    response = ec2_client.describe_instance_status(IncludeAllInstances=True)
-    events = response.get('InstanceStatuses', [])
-    open_upcoming_events = []
-    
-    # Filter events with status codes "open" and "upcoming"
-    for event in events:
-        if 'Events' in event:
-            for e in event['Events']:
-                if e['StatusCode'] in ('open', 'upcoming'):
-                    open_upcoming_events.append(e)
-    
-    return open_upcoming_events
-
-def get_event_details(event_ids, event_source):
-    if event_source == 'rds':
-        rds_client = boto3.client('rds', region_name='us-east-1')
-        response = rds_client.describe_event_categories(SourceType='db-instance')
-        event_categories = response.get('EventCategoriesMapList', [])
-        event_id_to_category_map = {cat['EventId']: cat['EventCategory'] for cat in event_categories}
-        
-        event_details = []
-        for event_id in event_ids:
-            response = rds_client.describe_events(EventId=event_id)
-            event = response['Events'][0]
-            event_category = event_id_to_category_map.get(event_id, 'Unknown')
-            event_details.append({
-                'EventId': event_id,
-                'Category': event_category,
-                'Message': event['Message'],
-                'EventTime': event['EventTime'].isoformat()
-            })
-        
-        return event_details
-    elif event_source == 'ec2':
-        ec2_client = boto3.client('ec2', region_name='us-east-1')
-        response = ec2_client.describe_event_details(EventIds=event_ids)
-        return response['InstanceEvents']
-    else:
-        return []
-
-def get_affected_entities(instance_id):
-    ec2_client = boto3.client('ec2', region_name='us-east-1')
-    
-    response = ec2_client.describe_instances(InstanceIds=[instance_id])
-    instances = response.get('Reservations', [])
-    
-    affected_entities = []
-    for instance in instances:
-        for i in instance['Instances']:
-            affected_entities.append({
-                'InstanceId': i['InstanceId'],
-                'InstanceType': i['InstanceType'],
-                'AvailabilityZone': i['Placement']['AvailabilityZone'],
-                'State': i['State']['Name']
-            })
-    
-    return affected_entities
+import datetime
 
 def lambda_handler(event, context):
-    rds_events = get_rds_events()
-    ec2_events = get_ec2_events()
+    # Initialize boto3 clients for EC2, RDS, and SNS
+    ec2_client = boto3.client('ec2', region_name='us-east-1')
+    rds_client = boto3.client('rds', region_name='us-east-1')
+    sns_client = boto3.client('sns')
     
-    if not rds_events and not ec2_events:
-        return {
-            'statusCode': 200,
-            'body': 'No open or upcoming events found.'
-        }
+    # Get current date and time
+    current_time = datetime.datetime.now(datetime.timezone.utc)
     
-    rds_event_details = get_event_details([event['EventId'] for event in rds_events], 'rds')
-    ec2_event_details = get_event_details([event['InstanceEventId'] for event in ec2_events], 'ec2')
-    sns_message = "The following open or upcoming events were found:\n\n"
-    
-    for event in rds_event_details + ec2_event_details:
-        sns_message += f"Event ID: {event['EventId']}\n"
-        sns_message += f"Event Category: {event['Category']}\n"
-        sns_message += f"Description: {event['Message']}\n"
-        sns_message += f"Event Time: {event['EventTime']}\n"
-        
-        if 'InstanceId' in event:
-            affected_entities = get_affected_entities(event['InstanceId'])
-            sns_message += "Affected Instances:\n"
-            
-            for entity in affected_entities:
-                sns_message += f" - Instance ID: {entity['InstanceId']}, "
-                sns_message += f"Type: {entity['InstanceType']}, "
-                sns_message += f"Availability Zone: {entity['AvailabilityZone']}, "
-                sns_message += f"State: {entity['State']}\n"
-        
-        sns_message += "\n"
-    
-    sns_client = boto3.client('sns', region_name='us-east-1')
-    sns_client.publish(
-        TopicArn='YOUR_SNS_TOPIC_ARN',  # Replace 'YOUR_SNS_TOPIC_ARN' with the actual ARN of your SNS topic
-        Subject='AWS Events Alert',
-        Message=sns_message
+    # Get EC2 events
+    ec2_events = ec2_client.describe_events(
+        StartTime=current_time,
+        Filters=[
+            {'Name': 'event-status-code', 'Values': ['open', 'upcoming']}
+        ]
     )
     
-    return {
-        'statusCode': 200,
-        'body': 'Lambda function executed successfully!'
-    }
+    # Get RDS events
+    rds_events = rds_client.describe_events(
+        StartTime=current_time,
+        Filters=[
+            {'Name': 'event-status', 'Values': ['open', 'upcoming']}
+        ]
+    )
+    
+    # Check if there are any open or upcoming events for EC2 instances
+    ec2_affected_entities = []
+    for event in ec2_events['Events']:
+        ec2_affected_entities.extend(event.get('affectedEntities', []))
+    
+    # Check if there are any open or upcoming events for RDS instances
+    rds_affected_entities = []
+    for event in rds_events['Events']:
+        rds_affected_entities.extend(event.get('eventCategories', []))
+    
+    # Combine affected entities from EC2 and RDS
+    all_affected_entities = ec2_affected_entities + rds_affected_entities
+    
+    # Send SNS notification if there are any open or upcoming events
+    if all_affected_entities:
+        sns_topic_arn = 'YOUR_SNS_TOPIC_ARN'  # Replace with your SNS topic ARN
+        sns_message = "Open or upcoming health events detected in us-east-1 region:\n"
+        
+        for entity in all_affected_entities:
+            sns_message += f"- {entity}\n"
+        
+        sns_client.publish(
+            TopicArn=sns_topic_arn,
+            Message=sns_message,
+            Subject="Open or Upcoming Health Events Detected"
+        )
+    
+    return "Function execution completed."
